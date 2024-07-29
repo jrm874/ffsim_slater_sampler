@@ -139,6 +139,42 @@ def sample_slater(
         )
 
 
+def _generate_marginals_vec(
+    rdm: np.ndarray,
+    sample: np.ndarray[int],
+    empty_orbitals: np.ndarray[int],
+) -> np.ndarray:
+    """Computes the marginal probabilities for adding a particle.
+
+    This is a step of the autoregressive sampling, and uses Bayes's rule.
+
+    Args:
+        rdm: A Numpy array with the one-body reduced density matrix.
+        pos_array: A Numpy array with the positions of the particles.
+        empty_orbitals: A Numpy array with the empty orbitals that a new particle
+            may occupy. The sorted union of ``pos_array`` and ``empty_orbitals``
+            must be equal to ``numpy.arange(num_orbitals)``.
+
+    Returns:
+        A Numpy array with the marginal corresponding to having the particles in the
+        position array and one extra in all possible empty orbitals.
+
+    """
+    shots, num_empty_orbitals = empty_orbitals.shape
+    marginals = np.zeros((shots, num_empty_orbitals), dtype=float)
+
+    for i in range(num_empty_orbitals):
+        new_sample = np.concatenate(
+            (sample, np.expand_dims(empty_orbitals[:, i], axis=1)), axis=1
+        )
+        rest_rdm = np.array(
+            [rdm[np.ix_(new_sample[j], new_sample[j])] for j in range(shots)]
+        )
+        marginals[:, i] = np.linalg.det(rest_rdm).real
+
+    return marginals
+
+
 def _generate_marginals(
     rdm: np.ndarray,
     sample: list[int],
@@ -166,6 +202,51 @@ def _generate_marginals(
         rest_rdm = rdm[np.ix_(new_sample, new_sample)]
         marginals[i] = np.linalg.det(rest_rdm).real
     return marginals
+
+
+def _autoregressive_slater_vec(
+    rdm: np.ndarray,
+    norb: int,
+    nelec: int,
+    shots: int,
+    seed: np.random.Generator | int | None = None,
+) -> list[int]:
+    rng = np.random.default_rng(seed)
+    probs = np.diag(rdm).real / nelec
+    sample = np.zeros((shots, nelec), dtype=int)
+    sample[:, 0] = rng.choice(norb, p=probs, size=shots)
+    marginal = np.zeros((shots, nelec))
+    marginal[:, 0] = probs[sample[:, 0]]
+    all_orbs = np.arange(norb)
+
+    empty_orbitals = np.array(
+        [np.setdiff1d(all_orbs, sample[i, 0], assume_unique=True) for i in range(shots)]
+    )
+
+    for k in range(nelec - 1):
+        if k == 0:
+            samples = sample[:, k][:, np.newaxis]
+        else:
+            samples = sample[:, :k]
+        marginals = _generate_marginals_vec(rdm, samples, empty_orbitals)
+        conditionals = marginals / marginal[:, k][:, np.newaxis]
+        conditionals /= np.sum(conditionals, axis=1)[:, np.newaxis]
+        index = np.array(
+            [rng.choice(norb - 1 - k, p=conditionals[j]) for j in range(shots)],
+            dtype=int,
+        )
+        sample[:, k + 1] = np.squeeze(
+            np.take_along_axis(empty_orbitals, index[:, np.newaxis], axis=1)
+        )
+        marginal[:, k + 1] = np.squeeze(
+            np.take_along_axis(marginals, index[:, np.newaxis], axis=1)
+        )
+
+        mask = np.ones((shots, norb - 1 - k), dtype=bool)
+        mask[range(shots), index] = False
+        empty_orbitals = empty_orbitals[mask].reshape(shots, norb - 2 - k)
+
+    return sample
 
 
 def _autoregressive_slater(
